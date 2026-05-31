@@ -7,16 +7,20 @@ import { fileURLToPath } from "url";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
 const COOKIES_FILE = path.join(__dirname, "../../cookies/youtube_cookies.txt");
 
+// yt-dlp runtime name differs by OS:
+//   Windows local: "nodejs"
+//   Render (Linux): "node"
+const JS_RUNTIME = process.platform === "win32" ? "nodejs" : "node";
+
 function getYouTubeArgs() {
-  const args = [
-    "--js-runtimes", "nodejs",   // fixes "n challenge solving failed"
-  ];
+  const args = ["--js-runtimes", JS_RUNTIME];
   if (existsSync(COOKIES_FILE)) {
     args.push("--cookies", COOKIES_FILE);
-    console.log("   Using YouTube cookies");
+    console.log(`   Using cookies: ${COOKIES_FILE}`);
+  } else {
+    console.warn("   No cookies file found — YouTube may block with 429");
   }
   return args;
 }
@@ -60,15 +64,13 @@ export async function extractMetadata(url, videoId) {
     ? (((likes + comments) / views) * 100).toFixed(4)
     : "0.0000";
 
-  const hashtags = extractHashtags(rawJson.tags || [], rawJson.description || "");
-
   return {
     videoId,
     platform,
     url,
     title:         rawJson.title       || "Unknown",
-    creator:       rawJson.uploader    || rawJson.channel    || "Unknown",
-    creatorHandle: rawJson.uploader_id || rawJson.channel_id || "Unknown",
+    creator:       rawJson.uploader    || rawJson.channel       || "Unknown",
+    creatorHandle: rawJson.uploader_id || rawJson.channel_id    || "Unknown",
     followerCount: rawJson.channel_follower_count || rawJson.uploader_follower_count || null,
     views,
     likes,
@@ -77,7 +79,7 @@ export async function extractMetadata(url, videoId) {
     duration:    rawJson.duration    || 0,
     uploadDate:  rawJson.upload_date || null,
     description: rawJson.description || "",
-    hashtags,
+    hashtags:    extractHashtags(rawJson.tags || [], rawJson.description || ""),
     thumbnail:   rawJson.thumbnail   || null,
   };
 }

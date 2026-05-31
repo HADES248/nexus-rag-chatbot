@@ -1,5 +1,5 @@
 // src/services/transcriptFetcher.js
-import { execFile, exec } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 import { createReadStream, unlink, existsSync } from "fs";
 import { readdir } from "fs/promises";
@@ -10,21 +10,19 @@ import { YoutubeTranscript } from "youtube-transcript";
 import Groq from "groq-sdk";
 
 const execFileAsync = promisify(execFile);
-const execAsync    = promisify(exec);
-const unlinkAsync  = promisify(unlink);
-const __dirname    = path.dirname(fileURLToPath(import.meta.url));
+const unlinkAsync   = promisify(unlink);
+const __dirname     = path.dirname(fileURLToPath(import.meta.url));
+const COOKIES_FILE  = path.join(__dirname, "../../cookies/youtube_cookies.txt");
 
-const COOKIES_FILE = path.join(__dirname, "../../cookies/youtube_cookies.txt");
+// "nodejs" on Windows, "node" on Linux (Render)
+const JS_RUNTIME = process.platform === "win32" ? "nodejs" : "node";
 
 function getYouTubeArgs() {
-  const args = ["--js-runtimes", "nodejs"];
-  if (existsSync(COOKIES_FILE)) {
-    args.push("--cookies", COOKIES_FILE);
-  }
+  const args = ["--js-runtimes", JS_RUNTIME];
+  if (existsSync(COOKIES_FILE)) args.push("--cookies", COOKIES_FILE);
   return args;
 }
 
-// ── Groq client ───────────────────────────────────────────
 let _groq = null;
 function getGroq() {
   if (!_groq) {
@@ -39,7 +37,7 @@ export async function fetchYouTubeTranscript(url) {
   const videoId = extractYouTubeId(url);
   if (!videoId) throw new Error(`Cannot parse YouTube video ID from: ${url}`);
 
-  // Primary: youtube-transcript npm — fastest, no yt-dlp needed
+  // Primary: youtube-transcript npm — no yt-dlp, no bot detection issues
   try {
     const chunks = await YoutubeTranscript.fetchTranscript(videoId);
     const text = chunks.map((c) => c.text).join(" ").trim();
@@ -50,21 +48,17 @@ export async function fetchYouTubeTranscript(url) {
     console.warn(`   youtube-transcript failed: ${err.message}, trying yt-dlp...`);
   }
 
-  // Fallback: yt-dlp with nodejs JS runtime + cookies
+  // Fallback: yt-dlp with correct runtime + cookies
   const tmpDir = os.tmpdir();
   const out    = path.join(tmpDir, `yt_sub_${Date.now()}`);
 
   await execFileAsync(
     "yt-dlp",
     [
-      "--write-auto-sub",
-      "--sub-lang", "en",
-      "--sub-format", "vtt",
-      "--skip-download",
+      "--write-auto-sub", "--sub-lang", "en",
+      "--sub-format", "vtt", "--skip-download",
       ...getYouTubeArgs(),
-      "-o", out,
-      "--no-playlist",
-      url,
+      "-o", out, "--no-playlist", url,
     ],
     { timeout: 60_000 }
   );
@@ -85,24 +79,18 @@ export async function fetchInstagramTranscript(url) {
 
   await execFileAsync(
     "yt-dlp",
-    [
-      "-f", "bestaudio",
-      "-o", `${tmpBase}.%(ext)s`,
-      "--no-playlist",
-      "--no-warnings",
-      url,
-    ],
+    ["-f", "bestaudio", "-o", `${tmpBase}.%(ext)s`,
+     "--no-playlist", "--no-warnings", url],
     { timeout: 180_000 }
   );
 
   const audioFile = await findDownloadedFile(tmpBase);
   if (!audioFile) throw new Error("yt-dlp ran but no audio file was created");
 
-  console.log(`   Downloaded: ${path.basename(audioFile)}`);
-  console.log("   Transcribing with Groq Whisper...");
+  console.log(`   Transcribing ${path.basename(audioFile)} with Groq Whisper...`);
 
   const transcription = await getGroq().audio.transcriptions.create({
-    file:  createReadStream(audioFile),
+    file: createReadStream(audioFile),
     model: "whisper-large-v3-turbo",
   });
 
@@ -114,31 +102,29 @@ export async function fetchInstagramTranscript(url) {
 
 // ── Helpers ───────────────────────────────────────────────
 async function findDownloadedFile(tmpBase) {
-  const dir      = path.dirname(tmpBase);
-  const baseName = path.basename(tmpBase);
+  const dir = path.dirname(tmpBase);
+  const base = path.basename(tmpBase);
   try {
     const files = await readdir(dir);
-    const match = files.find((f) => f.startsWith(baseName) && !f.endsWith(".part"));
+    const match = files.find((f) => f.startsWith(base) && !f.endsWith(".part"));
     return match ? path.join(dir, match) : null;
   } catch { return null; }
 }
 
 async function cleanupTempFiles(tmpBase) {
-  const dir      = path.dirname(tmpBase);
-  const baseName = path.basename(tmpBase);
+  const dir = path.dirname(tmpBase);
+  const base = path.basename(tmpBase);
   try {
     const files = await readdir(dir);
     for (const f of files) {
-      if (f.startsWith(baseName)) {
-        try { await unlinkAsync(path.join(dir, f)); } catch (_) {}
-      }
+      if (f.startsWith(base)) try { await unlinkAsync(path.join(dir, f)); } catch (_) {}
     }
   } catch (_) {}
 }
 
 function parseVttToText(vtt) {
   const seen = new Set();
-  const out  = [];
+  const out = [];
   for (const line of vtt.split("\n")) {
     const s = line.trim();
     if (!s || s === "WEBVTT" || /^\d{2}:\d{2}/.test(s) ||
