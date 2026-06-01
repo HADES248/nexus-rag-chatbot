@@ -1,7 +1,7 @@
 // src/services/transcriptFetcher.js
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { createReadStream, createWriteStream, unlink } from "fs";
+import { createReadStream, unlink } from "fs";
 import { readdir } from "fs/promises";
 import path from "path";
 import os from "os";
@@ -22,110 +22,108 @@ function getGroq() {
 
 // ── YouTube ───────────────────────────────────────────────
 export async function fetchYouTubeTranscript(url) {
+  // Clean URL — strip extra params that confuse yt-dlp
   const videoId = extractYouTubeId(url);
   if (!videoId) throw new Error(`Cannot parse YouTube video ID from: ${url}`);
+  const cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
+  // 1. youtube-transcript npm
   try {
     const chunks = await YoutubeTranscript.fetchTranscript(videoId);
     const text = chunks.map((c) => c.text).join(" ").trim();
     if (!text) throw new Error("Empty transcript");
-    console.log(`YouTube transcript via subtitles: ${text.length} chars`);
+    console.log(`   ✅ youtube-transcript: ${text.length} chars`);
     return text;
   } catch (err) {
-    console.warn(`   Subtitles unavailable: ${err.message}`);
-    console.log(`   Falling back to ytdl-core + Whisper...`);
+    console.warn(`   youtube-transcript failed: ${err.message}`);
   }
 
-  const tmpFile = path.join(os.tmpdir(), `yt_audio_${Date.now()}.webm`);
-  try {
-    await downloadWithYtdlCore(url, tmpFile);
-    return await transcribeFile(tmpFile);
-  } catch (ytdlErr) {
-    console.warn(`ytdl-core failed: ${ytdlErr.message}`);
-    console.log(`Last resort: yt-dlp fallback...`);
-    return await downloadWithYtdlp(url, true);
-  } finally {
-    try { await unlinkAsync(tmpFile); } catch (_) {}
+  // 2. Supadata API
+  const supKey = process.env.SUPADATA_API_KEY;
+  if (supKey) {
+    try {
+      console.log(`   Trying Supadata for ${videoId}...`);
+
+      const res = await fetch(
+        `https://api.supadata.ai/v1/youtube/transcript?videoId=${videoId}&lang=en&text=true`,
+        { headers: { "x-api-key": supKey } }
+      );
+
+      console.log(`   Supadata status: ${res.status}`);
+      const raw = await res.text();
+      console.log(`   Supadata raw response: ${raw.slice(0, 300)}`);
+
+      if (!res.ok) throw new Error(`Supadata ${res.status}: ${raw}`);
+
+      let data;
+      try { data = JSON.parse(raw); } catch { data = null; }
+
+      let text = "";
+      if (typeof raw === "string" && !raw.startsWith("{") && !raw.startsWith("[")) {
+        // Plain text response
+        text = raw.trim();
+      } else if (data) {
+        if (typeof data.content === "string") text = data.content;
+        else if (Array.isArray(data.content)) text = data.content.map((c) => c.text || "").join(" ");
+        else if (typeof data.transcript === "string") text = data.transcript;
+        else if (typeof data.text === "string") text = data.text;
+        else text = JSON.stringify(data);
+      }
+
+      text = text.trim();
+      if (!text || text.length < 10) throw new Error("Supadata returned empty/invalid transcript");
+
+      console.log(`   ✅ Supadata transcript: ${text.length} chars`);
+      return text;
+
+    } catch (err) {
+      console.warn(`   Supadata failed: ${err.message}`);
+    }
+  } else {
+    console.warn("   SUPADATA_API_KEY not set");
   }
+
+  // 3. Nothing worked
+  throw new Error(
+    `Cannot get transcript for ${videoId}. ` +
+    `Video may have no captions and server IP is blocked by YouTube. ` +
+    `Add SUPADATA_API_KEY env var (free at supadata.ai) to fix this.`
+  );
 }
 
 // ── Instagram ─────────────────────────────────────────────
 export async function fetchInstagramTranscript(url) {
-  console.log("Downloading Instagram audio via yt-dlp...");
-  return await downloadWithYtdlp(url, false);
-}
+  const tmpDir  = os.tmpdir();
+  const tmpBase = path.join(tmpDir, `reel_${Date.now()}`);
 
-// ── ytdl-core download (pure Node, no bot detection) ──────
-async function downloadWithYtdlCore(url, tmpFile) {
-  // Dynamic import so server still starts even if package has issues
-  const { default: ytdl } = await import("@distube/ytdl-core");
-
-  if (!ytdl.validateURL(url)) throw new Error(`Invalid YouTube URL: ${url}`);
-
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error("ytdl-core download timed out after 3 minutes"));
-    }, 180_000);
-
-    const stream = ytdl(url, {
-      quality: "highestaudio",
-      filter:  "audioonly",
-    });
-
-    const file = createWriteStream(tmpFile);
-
-    stream.on("error", (err) => {
-      clearTimeout(timeout);
-      reject(new Error(`ytdl-core stream error: ${err.message}`));
-    });
-
-    file.on("error", (err) => {
-      clearTimeout(timeout);
-      reject(new Error(`File write error: ${err.message}`));
-    });
-
-    file.on("finish", () => {
-      clearTimeout(timeout);
-      resolve();
-    });
-
-    stream.pipe(file);
-  });
-}
-
-async function downloadWithYtdlp(url, isYouTube) {
-  const tmpBase = path.join(os.tmpdir(), `audio_${Date.now()}`);
-
-  const args = [
-    "-f", "bestaudio",
-    "-o", `${tmpBase}.%(ext)s`,
-    "--no-playlist",
-    "--no-warnings",
-    url,
-  ];
+  console.log("   Downloading Instagram audio...");
 
   try {
-    await execFileAsync("yt-dlp", args, { timeout: 180_000 });
+    await execFileAsync(
+      "yt-dlp",
+      ["-f", "bestaudio", "-o", `${tmpBase}.%(ext)s`,
+       "--no-playlist", "--no-warnings", url],
+      { timeout: 180_000 }
+    );
+
     const audioFile = await findDownloadedFile(tmpBase);
-    if (!audioFile) throw new Error("No audio file created by yt-dlp");
+    if (!audioFile) throw new Error("No audio file created");
+
     console.log(`   Downloaded: ${path.basename(audioFile)}`);
-    return await transcribeFile(audioFile);
+
+    const transcription = await getGroq().audio.transcriptions.create({
+      file: createReadStream(audioFile),
+      model: "whisper-large-v3-turbo",
+    });
+
+    const text = transcription.text?.trim() || "";
+    if (!text) throw new Error("Whisper returned empty transcription");
+    console.log(`   ✅ Instagram transcript: ${text.length} chars`);
+    return text;
+
   } finally {
     await cleanupTempFiles(tmpBase);
   }
-}
-
-// ── Groq Whisper transcription ────────────────────────────
-async function transcribeFile(filePath) {
-  console.log(`   Transcribing with Groq Whisper...`);
-  const transcription = await getGroq().audio.transcriptions.create({
-    file:  createReadStream(filePath),
-    model: "whisper-large-v3-turbo",
-  });
-  const text = transcription.text?.trim() || "";
-  if (!text) throw new Error("Whisper returned empty transcription");
-  console.log(`Transcript: ${text.length} chars`);
-  return text;
 }
 
 // ── Helpers ───────────────────────────────────────────────
