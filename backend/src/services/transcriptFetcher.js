@@ -1,8 +1,13 @@
 // src/services/transcriptFetcher.js
 // ─────────────────────────────────────────────────────────
-// YouTube  → youtube-transcript npm (hits subtitle endpoint directly,
-//            no yt-dlp, no bot detection, works on any server IP)
-// Instagram → yt-dlp downloads raw audio → Groq Whisper (free)
+// YouTube:
+//   1st try → youtube-transcript npm (fastest, no download needed)
+//   2nd try → yt-dlp download audio → Groq Whisper (handles any video)
+//
+// Instagram:
+//   yt-dlp download audio → Groq Whisper
+//
+// This means ANY video works — even ones with transcripts disabled.
 // ─────────────────────────────────────────────────────────
 import { execFile } from "child_process";
 import { promisify } from "util";
@@ -26,46 +31,48 @@ function getGroq() {
 }
 
 // ── YouTube ───────────────────────────────────────────────
-// Uses youtube-transcript npm only — no yt-dlp, no cookies needed.
-// This hits YouTube's subtitle/caption endpoint directly which is
-// never blocked by YouTube's bot detection on server IPs.
 export async function fetchYouTubeTranscript(url) {
   const videoId = extractYouTubeId(url);
   if (!videoId) throw new Error(`Cannot parse YouTube video ID from: ${url}`);
 
+  // Primary: youtube-transcript — instant, no download
   try {
     const chunks = await YoutubeTranscript.fetchTranscript(videoId);
     const text = chunks.map((c) => c.text).join(" ").trim();
-    if (!text) throw new Error("Empty transcript returned");
-    console.log(`   ✅ YouTube transcript: ${text.length} chars`);
+    if (!text) throw new Error("Empty transcript");
+    console.log(`   ✅ YouTube transcript via subtitles: ${text.length} chars`);
     return text;
   } catch (err) {
-    throw new Error(
-      `Could not fetch YouTube transcript for ${videoId}: ${err.message}. ` +
-      `Make sure the video has captions enabled (auto-generated counts).`
-    );
+    console.warn(`   Subtitles unavailable (${err.message})`);
+    console.log(`   Falling back to audio download + Whisper...`);
   }
+
+  // Fallback: download audio → Groq Whisper
+  // Works for ANY YouTube video regardless of caption settings
+  return transcribeViaWhisper(
+    url,
+    ["bestaudio", "--no-playlist", "--no-warnings"]
+  );
 }
 
 // ── Instagram ─────────────────────────────────────────────
-// yt-dlp downloads raw audio (no ffmpeg conversion needed),
-// then Groq Whisper transcribes it for free.
 export async function fetchInstagramTranscript(url) {
-  const tmpDir  = os.tmpdir();
-  const tmpBase = path.join(tmpDir, `reel_${Date.now()}`);
+  console.log("   Downloading Instagram audio...");
+  return transcribeViaWhisper(
+    url,
+    ["-f", "bestaudio", "--no-playlist", "--no-warnings"]
+  );
+}
 
-  console.log("   Downloading Instagram audio via yt-dlp...");
+// ── Shared: download audio → Groq Whisper ─────────────────
+async function transcribeViaWhisper(url, extraArgs = []) {
+  const tmpDir  = os.tmpdir();
+  const tmpBase = path.join(tmpDir, `audio_${Date.now()}`);
 
   try {
     await execFileAsync(
       "yt-dlp",
-      [
-        "-f", "bestaudio",
-        "-o", `${tmpBase}.%(ext)s`,
-        "--no-playlist",
-        "--no-warnings",
-        url,
-      ],
+      ["-f", "bestaudio", "-o", `${tmpBase}.%(ext)s`, ...extraArgs, url],
       { timeout: 180_000 }
     );
 
@@ -82,7 +89,7 @@ export async function fetchInstagramTranscript(url) {
     const text = transcription.text?.trim() || "";
     if (!text) throw new Error("Whisper returned empty transcription");
 
-    console.log(`   ✅ Instagram transcript: ${text.length} chars`);
+    console.log(`   ✅ Whisper transcript: ${text.length} chars`);
     return text;
 
   } finally {
