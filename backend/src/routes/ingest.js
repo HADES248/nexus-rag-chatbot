@@ -6,32 +6,29 @@ import { getOrCreateSession } from "../services/ragGraph.js";
 
 const router = Router();
 
-const INGEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 mins
-
 router.post("/ingest", async (req, res) => {
-  req.setTimeout(INGEST_TIMEOUT_MS);
-  res.setTimeout(INGEST_TIMEOUT_MS);
+  req.setTimeout(10 * 60 * 1000);
+  res.setTimeout(10 * 60 * 1000);
 
   const { urlA, urlB, sessionId } = req.body;
 
   if (!urlA || !urlB || !sessionId) {
-    return res.status(400).json({ error: "Required fields: urlA, urlB, sessionId" });
+    return res.status(400).json({ error: "Required: urlA, urlB, sessionId" });
   }
 
-  // Early key check — fail fast with a clear message
-  if (!process.env.GROQ_API_KEY || process.env.GROQ_API_KEY === "gsk_xxxxxxxxxxxxxxxxxxxxxxxxxxxx") {
-    return res.status(500).json({
-      error: "GROQ_API_KEY is not set. Get a free key at console.groq.com and add it to backend/.env",
-    });
+  if (!process.env.GROQ_API_KEY) {
+    return res.status(500).json({ error: "GROQ_API_KEY not set in environment" });
+  }
+
+  if (!process.env.YOUTUBE_API_KEY) {
+    return res.status(500).json({ error: "YOUTUBE_API_KEY not set in environment" });
   }
 
   const platformA = detectPlatform(urlA);
   const platformB = detectPlatform(urlB);
 
   if (platformA === "unknown" || platformB === "unknown") {
-    return res.status(400).json({
-      error: "Both URLs must be valid YouTube or Instagram URLs",
-    });
+    return res.status(400).json({ error: "Both URLs must be YouTube or Instagram" });
   }
 
   console.log(`\n Ingest — session: ${sessionId}`);
@@ -39,65 +36,65 @@ router.post("/ingest", async (req, res) => {
   console.log(`   B (${platformB}): ${urlB}`);
 
   try {
-    console.log(" Extracting metadata...");
+    // Step 1: Metadata
+    console.log("Extracting metadata...");
     const [metaA, metaB] = await Promise.all([
       extractMetadata(urlA, "A"),
       extractMetadata(urlB, "B"),
     ]);
-    console.log(`   metaA: ${metaA.title}`);
-    console.log(`   metaB: ${metaB.title}`);
+    console.log(`   A: ${metaA.title}`);
+    console.log(`   B: ${metaB.title}`);
 
-    console.log("Fetching transcripts...");
-    const fetchTranscript = (url, platform) =>
-      platform === "youtube"
-        ? fetchYouTubeTranscript(url)
-        : fetchInstagramTranscript(url);
+    // Step 2: Transcripts — sequential to avoid memory spikes
+    // (two simultaneous audio downloads can OOM on Render free tier)
+    console.log("Fetching transcript A...");
+    const fetchFn = (url, platform) =>
+      platform === "youtube" ? fetchYouTubeTranscript(url) : fetchInstagramTranscript(url);
 
-    const [transcriptA, transcriptB] = await Promise.all([
-      fetchTranscript(urlA, platformA),
-      fetchTranscript(urlB, platformB),
-    ]);
+    const transcriptA = await fetchFn(urlA, platformA);
+    console.log("Fetching transcript B...");
+    const transcriptB = await fetchFn(urlB, platformB);
 
-    console.log(`   transcriptA: ${transcriptA?.length ?? 0} chars`);
-    console.log(`   transcriptB: ${transcriptB?.length ?? 0} chars`);
+    console.log(`   A: ${transcriptA?.length ?? 0} chars`);
+    console.log(`   B: ${transcriptB?.length ?? 0} chars`);
 
     if (!transcriptA || transcriptA.length < 20) {
-      return res.status(422).json({
-        error: "Could not get transcript for Video A. Make sure the video has captions or spoken audio.",
-      });
+      return res.status(422).json({ error: "Could not get transcript for Video A" });
     }
     if (!transcriptB || transcriptB.length < 20) {
-      return res.status(422).json({
-        error: "Could not get transcript for Video B. Make sure the reel has spoken audio.",
-      });
+      return res.status(422).json({ error: "Could not get transcript for Video B" });
     }
 
+    // Step 3: Embed
     console.log("Chunking + embedding...");
     const [chunksA, chunksB] = await Promise.all([
       chunkAndEmbed(transcriptA, metaA),
       chunkAndEmbed(transcriptB, metaB),
     ]);
 
+    // Step 4: Save session
     getOrCreateSession(sessionId, { A: metaA, B: metaB });
 
-    const payload = {
+    console.log(`Done — A: ${chunksA} chunks, B: ${chunksB} chunks`);
+
+    return res.json({
       success: true,
       sessionId,
       videos: {
         A: { ...metaA, transcriptPreview: transcriptA.slice(0, 200) + "...", chunksStored: chunksA },
         B: { ...metaB, transcriptPreview: transcriptB.slice(0, 200) + "...", chunksStored: chunksB },
       },
-    };
-
-    console.log(`Ingest complete — A: ${chunksA} chunks, B: ${chunksB} chunks`);
-    return res.json(payload);
+    });
 
   } catch (err) {
+    // Log full stack — critical for debugging on Render
     console.error("Ingest failed:", err.stack || err.message);
+
+    // Always return JSON — never let connection drop silently (causes ECONNRESET)
     if (!res.headersSent) {
       return res.status(500).json({
         error: err.message || "Ingest failed",
-        hint: "Check backend terminal for full error details.",
+        hint: "Check Render logs for full stack trace",
       });
     }
   }
