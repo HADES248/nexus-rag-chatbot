@@ -1,25 +1,18 @@
 // src/services/transcriptFetcher.js
-// ─────────────────────────────────────────────────────────
-// YouTube:
-//   1st try → youtube-transcript npm (fastest, no download needed)
-//   2nd try → yt-dlp download audio → Groq Whisper (handles any video)
-//
-// Instagram:
-//   yt-dlp download audio → Groq Whisper
-//
-// This means ANY video works — even ones with transcripts disabled.
-// ─────────────────────────────────────────────────────────
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { createReadStream, unlink } from "fs";
+import { createReadStream, unlink, existsSync } from "fs";
 import { readdir } from "fs/promises";
 import path from "path";
 import os from "os";
+import { fileURLToPath } from "url";
 import { YoutubeTranscript } from "youtube-transcript";
 import Groq from "groq-sdk";
 
 const execFileAsync = promisify(execFile);
 const unlinkAsync   = promisify(unlink);
+const __dirname     = path.dirname(fileURLToPath(import.meta.url));
+const COOKIES_FILE  = path.join(__dirname, "../../cookies/youtube_cookies.txt");
 
 let _groq = null;
 function getGroq() {
@@ -30,12 +23,17 @@ function getGroq() {
   return _groq;
 }
 
+// Returns cookies args only if the file exists
+function cookiesArgs() {
+  return existsSync(COOKIES_FILE) ? ["--cookies", COOKIES_FILE] : [];
+}
+
 // ── YouTube ───────────────────────────────────────────────
 export async function fetchYouTubeTranscript(url) {
   const videoId = extractYouTubeId(url);
   if (!videoId) throw new Error(`Cannot parse YouTube video ID from: ${url}`);
 
-  // Primary: youtube-transcript — instant, no download
+  // Primary: youtube-transcript npm — instant, no download needed
   try {
     const chunks = await YoutubeTranscript.fetchTranscript(videoId);
     const text = chunks.map((c) => c.text).join(" ").trim();
@@ -43,38 +41,45 @@ export async function fetchYouTubeTranscript(url) {
     console.log(`   ✅ YouTube transcript via subtitles: ${text.length} chars`);
     return text;
   } catch (err) {
-    console.warn(`   Subtitles unavailable (${err.message})`);
+    console.warn(`   Subtitles unavailable: ${err.message}`);
     console.log(`   Falling back to audio download + Whisper...`);
   }
 
   // Fallback: download audio → Groq Whisper
-  // Works for ANY YouTube video regardless of caption settings
-  return transcribeViaWhisper(
-    url,
-    ["bestaudio", "--no-playlist", "--no-warnings"]
-  );
+  return downloadAndTranscribe(url, true);
 }
 
 // ── Instagram ─────────────────────────────────────────────
 export async function fetchInstagramTranscript(url) {
   console.log("   Downloading Instagram audio...");
-  return transcribeViaWhisper(
-    url,
-    ["-f", "bestaudio", "--no-playlist", "--no-warnings"]
-  );
+  return downloadAndTranscribe(url, false);
 }
 
-// ── Shared: download audio → Groq Whisper ─────────────────
-async function transcribeViaWhisper(url, extraArgs = []) {
+// ── Core: download audio → Whisper ────────────────────────
+async function downloadAndTranscribe(url, isYouTube) {
   const tmpDir  = os.tmpdir();
   const tmpBase = path.join(tmpDir, `audio_${Date.now()}`);
 
+  // Build args cleanly — no spreading format strings as positional args
+  const args = [
+    "-f", "bestaudio",
+    "-o", `${tmpBase}.%(ext)s`,
+    "--no-playlist",
+    "--no-warnings",
+  ];
+
+  // YouTube needs cookies on server IPs to bypass bot detection
+  if (isYouTube) {
+    args.push(...cookiesArgs());
+  }
+
+  // URL always goes last
+  args.push(url);
+
+  console.log(`   yt-dlp args: ${args.join(" ")}`);
+
   try {
-    await execFileAsync(
-      "yt-dlp",
-      ["-f", "bestaudio", "-o", `${tmpBase}.%(ext)s`, ...extraArgs, url],
-      { timeout: 180_000 }
-    );
+    await execFileAsync("yt-dlp", args, { timeout: 180_000 });
 
     const audioFile = await findDownloadedFile(tmpBase);
     if (!audioFile) throw new Error("yt-dlp ran but no audio file was created");
@@ -88,7 +93,6 @@ async function transcribeViaWhisper(url, extraArgs = []) {
 
     const text = transcription.text?.trim() || "";
     if (!text) throw new Error("Whisper returned empty transcription");
-
     console.log(`   ✅ Whisper transcript: ${text.length} chars`);
     return text;
 
