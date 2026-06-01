@@ -1,27 +1,20 @@
 // src/services/transcriptFetcher.js
+// ─────────────────────────────────────────────────────────
+// YouTube  → youtube-transcript npm (hits subtitle endpoint directly,
+//            no yt-dlp, no bot detection, works on any server IP)
+// Instagram → yt-dlp downloads raw audio → Groq Whisper (free)
+// ─────────────────────────────────────────────────────────
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { createReadStream, unlink, existsSync } from "fs";
+import { createReadStream, unlink } from "fs";
 import { readdir } from "fs/promises";
 import path from "path";
 import os from "os";
-import { fileURLToPath } from "url";
 import { YoutubeTranscript } from "youtube-transcript";
 import Groq from "groq-sdk";
 
 const execFileAsync = promisify(execFile);
 const unlinkAsync   = promisify(unlink);
-const __dirname     = path.dirname(fileURLToPath(import.meta.url));
-const COOKIES_FILE  = path.join(__dirname, "../../cookies/youtube_cookies.txt");
-
-// "nodejs" on Windows, "node" on Linux (Render)
-const JS_RUNTIME = process.platform === "win32" ? "nodejs" : "node";
-
-function getYouTubeArgs() {
-  const args = ["--js-runtimes", JS_RUNTIME];
-  if (existsSync(COOKIES_FILE)) args.push("--cookies", COOKIES_FILE);
-  return args;
-}
 
 let _groq = null;
 function getGroq() {
@@ -33,76 +26,73 @@ function getGroq() {
 }
 
 // ── YouTube ───────────────────────────────────────────────
+// Uses youtube-transcript npm only — no yt-dlp, no cookies needed.
+// This hits YouTube's subtitle/caption endpoint directly which is
+// never blocked by YouTube's bot detection on server IPs.
 export async function fetchYouTubeTranscript(url) {
   const videoId = extractYouTubeId(url);
   if (!videoId) throw new Error(`Cannot parse YouTube video ID from: ${url}`);
 
-  // Primary: youtube-transcript npm — no yt-dlp, no bot detection issues
   try {
     const chunks = await YoutubeTranscript.fetchTranscript(videoId);
     const text = chunks.map((c) => c.text).join(" ").trim();
-    if (!text) throw new Error("Empty transcript");
+    if (!text) throw new Error("Empty transcript returned");
     console.log(`   ✅ YouTube transcript: ${text.length} chars`);
     return text;
   } catch (err) {
-    console.warn(`   youtube-transcript failed: ${err.message}, trying yt-dlp...`);
+    throw new Error(
+      `Could not fetch YouTube transcript for ${videoId}: ${err.message}. ` +
+      `Make sure the video has captions enabled (auto-generated counts).`
+    );
   }
-
-  // Fallback: yt-dlp with correct runtime + cookies
-  const tmpDir = os.tmpdir();
-  const out    = path.join(tmpDir, `yt_sub_${Date.now()}`);
-
-  await execFileAsync(
-    "yt-dlp",
-    [
-      "--write-auto-sub", "--sub-lang", "en",
-      "--sub-format", "vtt", "--skip-download",
-      ...getYouTubeArgs(),
-      "-o", out, "--no-playlist", url,
-    ],
-    { timeout: 60_000 }
-  );
-
-  const { readFile } = await import("fs/promises");
-  const vttPath = `${out}.en.vtt`;
-  const vtt = await readFile(vttPath, "utf8");
-  try { await unlinkAsync(vttPath); } catch (_) {}
-  return parseVttToText(vtt);
 }
 
 // ── Instagram ─────────────────────────────────────────────
+// yt-dlp downloads raw audio (no ffmpeg conversion needed),
+// then Groq Whisper transcribes it for free.
 export async function fetchInstagramTranscript(url) {
   const tmpDir  = os.tmpdir();
   const tmpBase = path.join(tmpDir, `reel_${Date.now()}`);
 
-  console.log("   Downloading Instagram audio...");
+  console.log("   Downloading Instagram audio via yt-dlp...");
 
-  await execFileAsync(
-    "yt-dlp",
-    ["-f", "bestaudio", "-o", `${tmpBase}.%(ext)s`,
-     "--no-playlist", "--no-warnings", url],
-    { timeout: 180_000 }
-  );
+  try {
+    await execFileAsync(
+      "yt-dlp",
+      [
+        "-f", "bestaudio",
+        "-o", `${tmpBase}.%(ext)s`,
+        "--no-playlist",
+        "--no-warnings",
+        url,
+      ],
+      { timeout: 180_000 }
+    );
 
-  const audioFile = await findDownloadedFile(tmpBase);
-  if (!audioFile) throw new Error("yt-dlp ran but no audio file was created");
+    const audioFile = await findDownloadedFile(tmpBase);
+    if (!audioFile) throw new Error("yt-dlp ran but no audio file was created");
 
-  console.log(`   Transcribing ${path.basename(audioFile)} with Groq Whisper...`);
+    console.log(`   Downloaded: ${path.basename(audioFile)}, transcribing...`);
 
-  const transcription = await getGroq().audio.transcriptions.create({
-    file: createReadStream(audioFile),
-    model: "whisper-large-v3-turbo",
-  });
+    const transcription = await getGroq().audio.transcriptions.create({
+      file:  createReadStream(audioFile),
+      model: "whisper-large-v3-turbo",
+    });
 
-  const text = transcription.text?.trim() || "";
-  console.log(`   ✅ Transcription: ${text.length} chars`);
-  await cleanupTempFiles(tmpBase);
-  return text;
+    const text = transcription.text?.trim() || "";
+    if (!text) throw new Error("Whisper returned empty transcription");
+
+    console.log(`   ✅ Instagram transcript: ${text.length} chars`);
+    return text;
+
+  } finally {
+    await cleanupTempFiles(tmpBase);
+  }
 }
 
 // ── Helpers ───────────────────────────────────────────────
 async function findDownloadedFile(tmpBase) {
-  const dir = path.dirname(tmpBase);
+  const dir  = path.dirname(tmpBase);
   const base = path.basename(tmpBase);
   try {
     const files = await readdir(dir);
@@ -112,27 +102,16 @@ async function findDownloadedFile(tmpBase) {
 }
 
 async function cleanupTempFiles(tmpBase) {
-  const dir = path.dirname(tmpBase);
+  const dir  = path.dirname(tmpBase);
   const base = path.basename(tmpBase);
   try {
     const files = await readdir(dir);
     for (const f of files) {
-      if (f.startsWith(base)) try { await unlinkAsync(path.join(dir, f)); } catch (_) {}
+      if (f.startsWith(base)) {
+        try { await unlinkAsync(path.join(dir, f)); } catch (_) {}
+      }
     }
   } catch (_) {}
-}
-
-function parseVttToText(vtt) {
-  const seen = new Set();
-  const out = [];
-  for (const line of vtt.split("\n")) {
-    const s = line.trim();
-    if (!s || s === "WEBVTT" || /^\d{2}:\d{2}/.test(s) ||
-        /^<\d{2}:\d{2}/.test(s) || /^\d+$/.test(s)) continue;
-    const clean = s.replace(/<[^>]+>/g, "").trim();
-    if (clean && !seen.has(clean)) { seen.add(clean); out.push(clean); }
-  }
-  return out.join(" ");
 }
 
 function extractYouTubeId(url) {
